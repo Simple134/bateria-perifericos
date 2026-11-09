@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Muestra la batería de los periféricos conectados a la Mac."""
+import plistlib
+import subprocess
+import time
+
+import hid
+
+LOGITECH = 0x046D
+STATUS_1004 = {0: "descargando", 1: "cargando", 2: "cargando", 3: "llena", 4: "error"}
+STATUS_1000 = {0: "descargando", 1: "cargando", 2: "casi llena", 3: "llena", 4: "cargando"}
+
+# Curva típica de una celda Li-ion de 1S (mV, %). Es una estimación, no la lectura del fabricante.
+LIION = [(3300, 0), (3500, 10), (3650, 25), (3750, 50), (3850, 70), (3950, 85), (4050, 95), (4200, 100)]
+
+
+def mv_to_percent(mv):
+    if mv <= LIION[0][0]:
+        return 0
+    for (v0, p0), (v1, p1) in zip(LIION, LIION[1:]):
+        if mv <= v1:
+            return round(p0 + (p1 - p0) * (mv - v0) / (v1 - v0))
+    return 100
+
+
+def apple_batteries():
+    out = subprocess.run(["ioreg", "-r", "-k", "BatteryPercent", "-a"], capture_output=True).stdout
+    if not out.strip():
+        return []
+    return [(d.get("Product", "Dispositivo Apple"), d["BatteryPercent"], "") for d in plistlib.loads(out)]
+
+
+def hidpp(h, idx, feat, fn=0, params=b""):
+    """Una petición HID++ 2.0. Devuelve la respuesta o None si no contesta o da error."""
+    h.write((bytes([0x11, idx, feat, (fn << 4) | 0x0A]) + params).ljust(20, b"\0"))
+    end = time.time() + 0.25
+    while time.time() < end:
+        r = h.read(64, 80)
+        if r and len(r) > 4 and r[1] == idx:
+            if r[2] == 0xFF:
+                return None
+            if r[2] == feat and r[3] & 0x0F == 0x0A:
+                return bytes(r)
+    return None
+
+
+def feature_index(h, idx, feature_id):
+    r = hidpp(h, idx, 0x00, 0, bytes([feature_id >> 8, feature_id & 0xFF]))
+    return r[4] if r and r[4] else None
+
+
+def device_name(h, idx, fallback):
+    i = feature_index(h, idx, 0x0005)
+    n = hidpp(h, idx, i, 0) if i else None
+    if not n:
+        return fallback
+    name = b""
+    while len(name) < n[4]:
+        r = hidpp(h, idx, i, 1, bytes([len(name)]))
+        if not r:
+            return fallback
+        name += r[4 : 4 + n[4] - len(name)]
+    return name.decode(errors="replace")
+
+
+def read_battery(h, idx):
+    """Devuelve (porcentaje, estado) probando las cuatro funciones de batería de Logitech."""
+    if i := feature_index(h, idx, 0x1004):
+        r = hidpp(h, idx, i, 1)
+        if r:
+            return r[4], STATUS_1004.get(r[6], "")
+    if i := feature_index(h, idx, 0x1000):
+        r = hidpp(h, idx, i, 0)
+        if r:
+            return r[4], STATUS_1000.get(r[6], "")
+    if i := feature_index(h, idx, 0x1001):
+        r = hidpp(h, idx, i, 0)
+        if r:
+            return mv_to_percent((r[4] << 8) | r[5]), "cargando" if r[6] & 0x80 else "descargando"
+    if i := feature_index(h, idx, 0x1F20):
+        r = hidpp(h, idx, i, 0)
+        if r:
+            mv = (r[4] << 8) | r[5]
+            return mv_to_percent(mv), f"estimado por voltaje ({mv} mV)"
+    return None
+
+
+def logitech_batteries():
+    rows = []
+    for d in hid.enumerate(LOGITECH):
+        key = (d["usage_page"], d["usage"])
+        if key not in ((0xFF00, 2), (0xFF43, 0x202)):
+            continue
+        is_receiver = "Receiver" in (d["product_string"] or "")
+        h = hid.device()
+        try:
+            h.open_path(d["path"])
+        except OSError:
+            rows.append((d["product_string"], None, "sin permiso para abrir"))
+            continue
+        for idx in range(1, 7) if is_receiver else (0xFF,):
+            if not hidpp(h, idx, 0x00, 1):
+                continue
+            name = device_name(h, idx, d["product_string"])
+            rows.append((name, *(read_battery(h, idx) or (None, "no reporta batería"))))
+        h.close()
+    return rows
+
+
+def opaque_devices():
+    """Receptores de otras marcas: se lee su descriptor HID desde ioreg, sin abrir el dispositivo."""
+    out = subprocess.run(["ioreg", "-r", "-c", "IOHIDDevice", "-a"], capture_output=True).stdout
+    groups = {}
+    for d in plistlib.loads(out) if out.strip() else []:
+        if d.get("VendorID") in (LOGITECH, 0x05AC, 0x3554) or d.get("Transport") != "USB":
+            continue
+        kind = {(1, 6): "teclado", (1, 2): "ratón"}.get((d.get("PrimaryUsagePage"), d.get("PrimaryUsage")))
+        g = groups.setdefault((d["VendorID"], d["ProductID"]), {"name": d.get("Product"), "kinds": set(), "battery": False, "vendor": False})
+        g["kinds"].update([kind] if kind else [])
+        desc = bytes(d.get("ReportDescriptor", b""))
+        g["battery"] |= b"\x05\x06\x09\x20" in desc
+        g["vendor"] |= d.get("PrimaryUsagePage", 0) >= 0xFF00
+    rows = []
+    for g in groups.values():
+        if not g["kinds"]:
+            continue
+        who = " + ".join(sorted(g["kinds"]))
+        why = "reporta batería HID estándar" if g["battery"] else "sin batería HID estándar" + (", canal propietario" if g["vendor"] else "")
+        rows.append((f"{g['name']} ({who})", None, why))
+    return rows
+
+
+def compx_keyboard():
+    """Teclados AULA y similares tras el receptor Compx 3554:fa09: reporte 0x13, comando 0x4A."""
+    d = next((d for d in hid.enumerate(0x3554, 0xFA09) if d["usage_page"] == 0xFF02), None)
+    if not d:
+        return None
+    name = f"{d['product_string']} (teclado)"
+    frame = [0x13, 0x4A] + [0] * 17
+    frame.append(sum(frame) & 0xFF)
+    h = hid.device()
+    try:
+        h.open_path(d["path"])
+        for _ in range(4):
+            h.write(bytes(frame))
+            end = time.time() + 0.5
+            while time.time() < end:
+                r = h.read(64, 50)
+                if len(r) >= 20 and r[0] == 0x13 and r[1] & 0x7F == 0x4A and sum(r[:19]) & 0xFF == r[19] and 1 <= r[5] <= 100:
+                    return name, r[5], "con cable" if r[6] == 0x10 else "en batería"
+        return name, None, "no respondió (teclado apagado o dormido)"
+    except OSError:
+        return name, None, "sin permiso: activa Monitoreo de entrada para la Terminal"
+    finally:
+        h.close()
+
+
+def read_all():
+    rows = apple_batteries() + logitech_batteries() + opaque_devices()
+    if kb := compx_keyboard():
+        rows.append(kb)
+    return rows
+
+
+def main():
+    rows = read_all()
+    if not rows:
+        print("No se encontró ningún periférico.")
+        return
+    width = max(len(r[0]) for r in rows)
+    for name, pct, note in rows:
+        bar = f"{pct:>3}%  " + "█" * (pct // 10) + "░" * (10 - pct // 10) if pct is not None else "  --"
+        print(f"{name:<{width}}  {bar}  {note}".rstrip())
+
+
+if __name__ == "__main__":
+    main()

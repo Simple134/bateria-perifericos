@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Periféricos</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --fg: #1d1d1f;
+    --fg2: #5a5a5f;
+    --line: rgba(0, 0, 0, .1);
+    --card: rgba(255, 255, 255, .55);
+    --track: #e4e4e9;
+    --alta: #1e8e3e;
+    --media: #a85a00;
+    --baja: #c70015;
+    --btn: rgba(0, 0, 0, .06);
+    --btn-hover: rgba(0, 0, 0, .12);
+    --focus: #0a60d6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #f5f5f7;
+      --fg2: #a8a8ae;
+      --line: rgba(255, 255, 255, .14);
+      --card: rgba(255, 255, 255, .07);
+      --track: #4a4a4e;
+      --alta: #32d74b;
+      --media: #ff9f0a;
+      --baja: #ff6961;
+      --btn: rgba(255, 255, 255, .1);
+      --btn-hover: rgba(255, 255, 255, .18);
+      --focus: #64a8ff;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { background: transparent; color: var(--fg); }
+  body {
+    font: 12px/1.4 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    user-select: none;
+    cursor: default;
+  }
+  #app { padding: 14px 14px 12px; }
+  header, footer { display: flex; align-items: center; justify-content: space-between; }
+  header { margin-bottom: 10px; }
+  h1 { font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
+  .cards { display: grid; gap: 8px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 12px 11px; }
+  .card.stale { opacity: .72; }
+  .top { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  h2 { font-size: 15px; font-weight: 500; letter-spacing: -.01em; }
+  .pct { font-size: 24px; font-weight: 600; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+  .bar { height: 6px; border-radius: 3px; background: var(--track); margin: 8px 0 9px; overflow: hidden; }
+  .bar i { display: block; height: 100%; border-radius: 3px; background: var(--fg2); }
+  .alta .bar i { background: var(--alta); }
+  .media .bar i { background: var(--media); }
+  .baja .bar i { background: var(--baja); }
+  .row { display: flex; justify-content: space-between; gap: 12px; color: var(--fg2); font-size: 12px; }
+  .row b { font-weight: 600; color: var(--fg); }
+  .src { color: var(--fg2); font-size: 12px; margin-top: 2px; }
+  .msg { color: var(--fg2); padding: 18px 4px; text-align: center; }
+  footer { margin-top: 12px; color: var(--fg2); font-size: 12px; }
+  button {
+    font: inherit; font-size: 12px; color: var(--fg); background: var(--btn);
+    border: 0; border-radius: 7px; padding: 4px 10px; cursor: default;
+  }
+  button:hover { background: var(--btn-hover); }
+  button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  .icon { width: 26px; height: 26px; padding: 0; display: grid; place-items: center; }
+  .icon svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>Periféricos</h1>
+    <button class="icon" id="refresh" aria-label="Actualizar lecturas" title="Actualizar">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.8-4.1"/><path d="M13.5 2.5v3h-3"/></svg>
+    </button>
+  </header>
+  <main class="cards" id="list" aria-live="polite"></main>
+  <footer>
+    <span id="updated"></span>
+    <button id="quit">Salir</button>
+  </footer>
+</div>
+<script>
+  const LABEL = { alta: 'Carga alta', media: 'Carga media', baja: 'Carga baja' };
+  const send = (m) => window.webkit.messageHandlers.bridge.postMessage(m);
+
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+
+  function ago(ts) {
+    const m = Math.max(0, Math.round((Date.now() / 1000 - ts) / 60));
+    if (m < 1) return 'hace un momento';
+    if (m < 60) return `hace ${m} min`;
+    return `hace ${Math.round(m / 60)} h`;
+  }
+
+  function card(r) {
+    const c = el('section', `card ${r.pct == null ? '' : r.level} ${r.stale ? 'stale' : ''}`);
+    const top = el('div', 'top');
+    top.append(el('h2', null, r.title), el('span', 'pct', r.pct == null ? '--' : `${r.pct}%`));
+    const bar = el('div', 'bar');
+    bar.setAttribute('role', 'progressbar');
+    bar.setAttribute('aria-label', r.title);
+    bar.setAttribute('aria-valuemin', '0');
+    bar.setAttribute('aria-valuemax', '100');
+    if (r.pct != null) bar.setAttribute('aria-valuenow', r.pct);
+    const fill = el('i');
+    fill.style.width = `${r.pct || 0}%`;
+    bar.append(fill);
+
+    let status, detail = '';
+    if (r.pct == null) status = r.note;
+    else if (r.stale) { status = 'Sin lectura reciente'; detail = `Última lectura ${ago(r.seen)}`; }
+    else if (r.charging) status = 'Cargando';
+    else status = LABEL[r.level];
+    const row = el('div', 'row');
+    row.append(el('b', null, status));
+    if (r.hours) row.append(el('span', null, r.hours));
+    else if (detail) row.append(el('span', null, detail));
+    else if (r.pct != null && !r.charging) row.append(el('span', null, 'Midiendo autonomía'));
+    c.append(top, bar, row);
+    if (r.source) c.append(el('p', 'src', r.source));
+    return c;
+  }
+
+  function render(s) {
+    window.state = s;
+    const list = document.getElementById('list');
+    list.replaceChildren();
+    if (s.loading) list.append(el('p', 'msg', 'Leyendo periféricos…'));
+    else if (!s.rows.length) list.append(el('p', 'msg', 'No se encontró ningún periférico. Conéctalo y pulsa Actualizar.'));
+    s.rows.forEach((r) => list.append(card(r)));
+    document.getElementById('updated').textContent = s.updated ? `Actualizado ${ago(s.updated)}` : '';
+    requestAnimationFrame(() => send('size:' + Math.ceil(document.getElementById('app').getBoundingClientRect().height)));
+  }
+
+  document.getElementById('refresh').addEventListener('click', () => {
+    document.getElementById('updated').textContent = 'Actualizando…';
+    send('refresh');
+  });
+  document.getElementById('quit').addEventListener('click', () => send('quit'));
+  setInterval(() => window.state && render(window.state), 30000);
+  render({ rows: [], updated: null, loading: true });
+</script>
+</body>
+</html>
